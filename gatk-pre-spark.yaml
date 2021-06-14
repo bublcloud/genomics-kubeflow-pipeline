@@ -1,0 +1,647 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: gatk-pre-
+spec:
+  entrypoint: gatk-pre
+
+  arguments:
+    parameters:
+    - name: sample-list
+      value: |
+        [{"uid": "run21", "R1": "ERR015525_1.fastq.gz", "R2": "ERR015525_2.fastq.gz"},{"uid": "run22", "R1": "ERR013115_1.fastq.gz", "R2": "ERR013115_2.fastq.gz"}]
+    - name: bucket
+      value: genomeflow
+    - name: endpoint
+      value: minio-service.miniosingle:9000
+    - name: secretKeyName
+      value: mlpipeline-minio-artifact
+    - name: accesskey
+      value: accesskey
+    - name: secretkey
+      value: secretkey
+    - name: workdir
+      value: workdir
+    - name: genome
+      value: Homo_sapiens_assembly38.fasta
+    - name: genome-dir
+      value: genome
+    - name: reference-dir
+      value: reference
+    - name: threads
+      value: 14
+    - name: bwa-threads
+      value: 28
+    - name: dbsnp
+      value: Homo_sapiens_assembly38.dbsnp138.vcf
+    - name: indel1
+      value: Homo_sapiens_assembly38.known_indels.vcf.gz
+    - name: indel2
+      value: Mills_and_1000G_gold_standard.indels.hg38.vcf.gz
+
+  templates:
+  - name: gatk-pre
+    steps:
+    - - name: gatk-pre-base
+        template: gatk-pre-steps
+        arguments:
+          parameters:
+          - name: uid
+            value: "{{item.uid}}"
+          - name: R1
+            value: "{{item.R1}}"
+          - name: R2
+            value: "{{item.R2}}"
+        withParam: "{{workflow.parameters.sample-list}}"
+
+
+  - name: gatk-pre-steps
+    inputs:
+      parameters:
+        - name: uid
+        - name: R1
+        - name: R2
+
+    steps:
+    - - name: bwa # add to this - artifact S3 repo, input/output in S3 repo
+        template: bwa-template
+        arguments:
+          parameters:
+          - name: uid
+            value: "{{inputs.parameters.uid}}"
+          - name: R1
+            value: "{{inputs.parameters.R1}}"
+          - name: R2
+            value: "{{inputs.parameters.R2}}"
+          - name: threads
+            value: "{{workflow.parameters.bwa-threads}}"
+
+    - - name: picard-readgroups  # now sort by query-name, next step sorts by position after but works better/faster with queryname
+        template: picard-readgroups-template
+        arguments:
+          parameters:
+          - name: uid
+            value: "{{inputs.parameters.uid}}"
+
+    - - name: MarkDuplicatesSpark
+        template: MarkDuplicatesSpark-template
+        arguments:
+          parameters:
+          - name: uid
+            value: "{{inputs.parameters.uid}}"
+          - name: threads
+            value: "{{workflow.parameters.threads}}"
+
+
+    - - name: setTags
+        template: setTags-template
+        arguments:
+          parameters:
+          - name: uid
+            value: "{{inputs.parameters.uid}}"
+    
+    - - name: BaseRecal
+        template: BaseRecal-template
+        arguments:
+          parameters:
+          - name: uid
+            value: "{{inputs.parameters.uid}}"
+          - name: threads
+            value: "{{workflow.parameters.threads}}"
+
+    - - name: picard-wgsmetrics
+        template: picard-wgsmetrics-template
+        arguments:
+          parameters:
+          - name: uid
+            value: "{{inputs.parameters.uid}}"
+
+
+  - name: bwa-template
+
+    retryStrategy:
+      retryPolicy: Always
+      limit: 5
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 8m
+
+    inputs:
+      parameters:
+      - name: uid
+      - name: R1
+      - name: R2
+      - name: threads
+      
+      artifacts:
+      - name: R1
+        path: /data/R1.fastq.gz
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{inputs.parameters.R1}}"
+          region: "us-east-1"
+
+      - name: R2
+        path: /data/R2.fastq.gz
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{inputs.parameters.R2}}"
+          region: "us-east-1"
+
+      - name: genome-bucket
+        path: /data/genome
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.genome-dir}}.tgz"
+          region: "us-east-1"
+
+    outputs:
+      artifacts:
+      - name: bucket-out
+        path: /data/aligned/
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.workdir}}/{{inputs.parameters.uid}}/aligned.tgz"
+          region: "us-east-1"
+
+
+    script:
+      image: dcibioinformatics/bwa
+      command: [bash]
+      source: |
+        mkdir /data/aligned
+        ls -lah /data/
+        ls -lah /data/genome/
+        bwa mem -aM -t {{inputs.parameters.threads}} /data/genome/{{workflow.parameters.genome}} /data/R1.fastq.gz /data/R2.fastq.gz > /data/aligned/aligned.sam && zcat /data/R1.fastq.gz | head -n 1 |  sed 's/[: .@]/_/g' |  cut -d "_" -f2 > /data/aligned/RGID.txt
+
+      volumeMounts:
+      - mountPath: /data
+        name: data
+
+      resources:
+        requests:
+          ephemeral-storage: 100Gi
+          memory: 110Gi
+          cpu: 30
+        limits:
+          ephemeral-storage: 700Gi
+          memory: 110Gi
+          cpu: 30
+
+  - name: picard-readgroups-template
+  
+    retryStrategy:
+      retryPolicy: Always
+      limit: 5
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 8m
+
+    inputs:
+      parameters:
+      - name: uid
+      
+      artifacts:
+      - name: aligned
+        path: /data/aligned/
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.workdir}}/{{inputs.parameters.uid}}/aligned.tgz"
+          region: "us-east-1"
+
+    outputs:
+      artifacts:
+      - name: sorted
+        path: /data/sorted/
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.workdir}}/{{inputs.parameters.uid}}/sorted.tgz"
+          region: "us-east-1"
+
+    script:
+      image: broadinstitute/picard
+      command: [bash]
+      source: |
+        mkdir /data/sorted
+        java -jar /usr/picard/picard.jar AddOrReplaceReadGroups I=/data/aligned/aligned.sam O=/data/sorted/sorted.bam RGID=$(cat /data/aligned/RGID.txt) RGPL=Illumina RGSM={{inputs.parameters.uid}} RGPU=$(cat /data/aligned/RGID.txt).{{inputs.parameters.uid}} RGLB={{inputs.parameters.uid}} VALIDATION_STRINGENCY=STRICT CREATE_INDEX=true SO=queryname
+
+      volumeMounts:
+      - mountPath: /data
+        name: data
+
+      resources:
+        requests:
+          ephemeral-storage: 120Gi
+          memory: 25Gi
+          cpu: 14
+        limits:
+          ephemeral-storage: 700Gi
+          memory: 25Gi
+          cpu: 14
+
+
+  - name: MarkDuplicatesSpark-template
+
+    retryStrategy:
+      retryPolicy: Always
+      limit: 5
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 8m
+
+    inputs:
+      parameters:
+      - name: uid
+      - name: threads
+
+      artifacts:
+      - name: bucket-in
+        path: /data/sorted/
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.workdir}}/{{inputs.parameters.uid}}/sorted.tgz"
+          region: "us-east-1"
+
+    outputs:
+      artifacts:
+      - name: marked
+        path: /data/marked/
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.workdir}}/{{inputs.parameters.uid}}/marked.tgz"
+          region: "us-east-1"
+
+    script:
+      image: broadinstitute/gatk:4.1.7.0
+      command: [bash]
+      source: |
+        mkdir /data/marked
+        gatk MarkDuplicatesSpark -I /data/sorted/sorted.bam -O /data/marked/marked.bam -M /data/marked/dup_metrics.txt --conf 'spark.executor.cores={{inputs.parameters.threads}}'
+
+      volumeMounts:
+      - mountPath: /data
+        name: data
+
+      resources:
+        requests:
+          ephemeral-storage: 120Gi
+          memory: 60Gi
+          cpu: 18
+        limits:
+          ephemeral-storage: 700Gi
+          memory: 60Gi
+          cpu: 18
+
+  - name: setTags-template
+
+    retryStrategy:
+      retryPolicy: Always
+      limit: 5
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 8m
+
+    inputs:
+      parameters:
+      - name: uid
+
+      artifacts:
+      - name: marked
+        path: /data/marked/
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.workdir}}/{{inputs.parameters.uid}}/marked.tgz"
+          region: "us-east-1"
+
+      - name: genome-bucket
+        path: /data/genome
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.genome-dir}}.tgz"
+          region: "us-east-1"
+
+    outputs:
+      artifacts:
+      - name: bucket-out
+        path: /data/tagged/
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.workdir}}/{{inputs.parameters.uid}}/tagged.tgz"
+          region: "us-east-1"
+
+    script:
+      image: broadinstitute/picard
+      command: [bash]
+      source: |
+        mkdir /data/tagged/
+        java -jar /usr/picard/picard.jar SetNmMdAndUqTags I=/data/marked/marked.bam O=/data/tagged/tagged.bam R=/data/genome/{{workflow.parameters.genome}} SET_ONLY_UQ=true CREATE_INDEX=true
+
+      volumeMounts:
+      - mountPath: /data
+        name: data
+
+      resources:
+        requests:
+          ephemeral-storage: 700Gi
+          memory: 22Gi
+          cpu: 14
+        limits:
+          ephemeral-storage: 700Gi
+          memory: 22Gi
+          cpu: 14
+
+
+  - name: BaseRecal-template
+  
+    retryStrategy:
+      retryPolicy: Always
+      limit: 5
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 8m
+
+    inputs:
+      parameters:
+      - name: uid
+      - name: threads
+
+      artifacts:
+      - name: tagged
+        path: /data/tagged/
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.workdir}}/{{inputs.parameters.uid}}/tagged.tgz"
+          region: "us-east-1"
+
+      - name: genome-bucket
+        path: /data/genome
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.genome-dir}}.tgz"
+          region: "us-east-1"
+
+      - name: reference-bucket
+        path: /data/reference
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.reference-dir}}.tgz"
+          region: "us-east-1"
+
+    outputs:
+      artifacts:
+      - name: bucket-out
+        path: /data/recal/
+        archive:
+          tar:
+            compressionLevel: 1
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.workdir}}/{{inputs.parameters.uid}}/recal.tgz"
+          region: "us-east-1"
+
+    script:
+      image: broadinstitute/gatk:4.1.7.0
+      command: [bash]
+      source: |
+        mkdir /data/recal
+        gatk BQSRPipelineSpark -I /data/tagged/tagged.bam --known-sites /data/reference/{{workflow.parameters.dbsnp}} --known-sites /data/reference/{{workflow.parameters.indel1}} --known-sites /data/reference/{{workflow.parameters.indel2}} -O /data/recal/recal.bam -R /data/genome/{{workflow.parameters.genome}} -OBI --conf 'spark.executor.cores={{inputs.parameters.threads}}'
+
+      volumeMounts:
+      - mountPath: /data
+        name: data
+
+      resources:
+        requests:
+          ephemeral-storage: 40Gi
+          memory: 60Gi
+          cpu: 18
+        limits:
+          ephemeral-storage: 700Gi
+          memory: 60Gi
+          cpu: 18
+
+  - name: picard-wgsmetrics-template
+
+    retryStrategy:
+      retryPolicy: Always
+      limit: 5
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 8m
+
+    inputs:
+      parameters:
+      - name: uid
+      
+      artifacts:
+      - name: recal
+        path: /data/recal/
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.workdir}}/{{inputs.parameters.uid}}/recal.tgz"
+          region: "us-east-1"
+
+      - name: genome-bucket
+        path: /data/genome
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.genome-dir}}.tgz"
+          region: "us-east-1"
+
+    outputs:
+      artifacts:
+      - name: wgsmetrics
+        path: /data/wgs_metrics.txt
+        archive: 
+          none: {}
+        s3:
+          insecure: true
+          bucket: "{{workflow.parameters.bucket}}"
+          endpoint: "{{workflow.parameters.endpoint}}"
+          accessKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.accesskey}}"
+          secretKeySecret:
+            name: "{{workflow.parameters.secretKeyName}}"
+            key: "{{workflow.parameters.secretkey}}"
+          key: "{{workflow.parameters.workdir}}/{{inputs.parameters.uid}}/wgs_metrics.txt"
+          region: "us-east-1"
+
+    script:
+      image: broadinstitute/picard
+      command: [bash]
+      source: |
+         java -jar /usr/picard/picard.jar CollectWgsMetrics I=/data/recal/recal.bam O=/data/wgs_metrics.txt R=/data/genome/{{workflow.parameters.genome}}
+
+      volumeMounts:
+      - mountPath: /data
+        name: data
+
+      resources:
+        requests:
+          ephemeral-storage: 100Gi
+          memory: 24Gi
+          cpu: 14
+        limits:
+          ephemeral-storage: 600Gi
+          memory: 24Gi
+          cpu: 14
+
+  volumes:
+  - name: data
+    emptyDir: {}
